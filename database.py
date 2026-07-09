@@ -119,6 +119,17 @@ class Database:
             ''', (user_id, today, future))
             return cursor.fetchall()
 
+    def get_all_active_subs(self) -> List[Tuple]:
+        """Все подписки (для восстановления напоминаний при запуске)"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, user_id, name, cost, renewal_date
+                FROM subscriptions
+                ORDER BY renewal_date
+            ''')
+            return cursor.fetchall()
+
     def mark_notified(self, sub_id: int):
         """Отметить подписку как уведомлённую"""
         with sqlite3.connect(self.db_path) as conn:

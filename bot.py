@@ -12,6 +12,66 @@ db = Database()
 
 
 # ============================================================
+# НАПОМИНАНИЯ (фоновые задачи)
+# ============================================================
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Отправить напоминание пользователю о скором истечении подписки"""
+    job_data = context.job.data
+    user_id = job_data['user_id']
+    sub_id = job_data['sub_id']
+    name = job_data['name']
+    renewal_date = job_data['renewal_date']
+
+    text = (
+        f"🔔 **Напоминание!**\n\n"
+        f"📝 Подписка **{name}** истекает завтра!\n"
+        f"📅 Дата: {renewal_date}\n\n"
+        f"Не забудьте продлить подписку."
+    )
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=text,
+        parse_mode='Markdown'
+    )
+    db.mark_notified(sub_id)
+
+
+def schedule_reminder(application, user_id: int, sub_id: int, name: str, renewal_date: str):
+    """Запланировать напоминание за 1 день до истечения подписки"""
+    renewal_dt = datetime.strptime(renewal_date, '%Y-%m-%d')
+    reminder_dt = renewal_dt - timedelta(days=1)
+
+    now = datetime.now()
+    if reminder_dt <= now:
+        return
+
+    delay = (reminder_dt - now).total_seconds()
+
+    application.job_queue.run_once(
+        send_reminder,
+        when=delay,
+        data={'user_id': user_id, 'sub_id': sub_id, 'name': name, 'renewal_date': renewal_date},
+        name=f'reminder_{sub_id}'
+    )
+
+
+def cancel_reminder(application, sub_id: int):
+    """Отменить запланированное напоминание"""
+    current_job = application.job_queue.get_jobs_by_name(f'reminder_{sub_id}')
+    for job in current_job:
+        job.schedule_removal()
+
+
+async def post_init(application):
+    """Восстановить напоминания после перезапуска бота"""
+    active_subs = db.get_all_active_subs()
+    for sub_id, user_id, name, cost, renewal_date in active_subs:
+        schedule_reminder(application, user_id, sub_id, name, renewal_date)
+
+
+# ============================================================
 # 1️⃣ REPLY-КЛАВИАТУРА (внизу экрана)
 # ============================================================
 async def list_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -210,9 +270,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name = context.user_data['sub_name']
             cost = context.user_data['sub_cost']
             sub_id = db.add_subscription(user_id, name, cost, date_str)
+            schedule_reminder(context.application, user_id, sub_id, name, date_str)
             context.user_data['expecting'] = None
             await update.message.reply_text(
-                f"✅ **Подписка добавлена!**\n📝 {name}\n💰 {cost:.2f} ₽\n📅 {date_str}\n🆔 ID: {sub_id}",
+                f"✅ **Подписка добавлена!**\n📝 {name}\n💰 {cost:.2f} ₽\n📅 {date_str}\n🆔 ID: {sub_id}\n🔔 Напоминание за 1 день запланировано",
                 parse_mode='Markdown',
                 reply_markup=get_reply_keyboard()
             )
@@ -228,6 +289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Подписка не найдена или не ваша.")
                 return
             if db.delete_subscription(sub_id):
+                cancel_reminder(context.application, sub_id)
                 context.user_data['expecting'] = None
                 await update.message.reply_text(
                     f"✅ **Подписка удалена!**\n📝 {sub[2]} ({sub[3]:.2f} ₽)",
@@ -249,10 +311,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             old_date = datetime.strptime(sub[4], '%Y-%m-%d')
             new_date = old_date + timedelta(days=30)
-            db.update_subscription(sub_id, sub[2], sub[3], new_date.strftime('%Y-%m-%d'))
+            new_date_str = new_date.strftime('%Y-%m-%d')
+            db.update_subscription(sub_id, sub[2], sub[3], new_date_str)
+            cancel_reminder(context.application, sub_id)
+            schedule_reminder(context.application, user_id, sub_id, sub[2], new_date_str)
             context.user_data['expecting'] = None
             await update.message.reply_text(
-                f"✅ **Продлено!**\n📝 {sub[2]}\n📅 {old_date.strftime('%d.%m.%Y')} → {new_date.strftime('%d.%m.%Y')}",
+                f"✅ **Продлено!**\n📝 {sub[2]}\n📅 {old_date.strftime('%d.%m.%Y')} → {new_date.strftime('%d.%m.%Y')}\n🔔 Напоминание обновлено",
                 parse_mode='Markdown',
                 reply_markup=get_reply_keyboard()
             )
@@ -335,12 +400,16 @@ async def handle_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     old_date = datetime.strptime(sub[4], '%Y-%m-%d')
     new_date = old_date + timedelta(days=30)
-    db.update_subscription(sub_id, sub[2], sub[3], new_date.strftime('%Y-%m-%d'))
+    new_date_str = new_date.strftime('%Y-%m-%d')
+    db.update_subscription(sub_id, sub[2], sub[3], new_date_str)
+    cancel_reminder(context.application, sub_id)
+    schedule_reminder(context.application, user_id, sub_id, sub[2], new_date_str)
     
     await query.edit_message_text(
         f"✅ **Подписка продлена!**\n\n"
         f"📝 {sub[2]}\n"
-        f"📅 {old_date.strftime('%d.%m.%Y')} → {new_date.strftime('%d.%m.%Y')}",
+        f"📅 {old_date.strftime('%d.%m.%Y')} → {new_date.strftime('%d.%m.%Y')}\n"
+        f"🔔 Напоминание обновлено",
         parse_mode='Markdown',
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 В меню", callback_data="main_menu")]
@@ -361,6 +430,7 @@ async def delete_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     if db.delete_subscription(sub_id):
+        cancel_reminder(context.application, sub_id)
         await query.edit_message_text(
             f"✅ **Подписка удалена!**\n\n"
             f"📝 {sub[2]} ({sub[3]:.2f} ₽)",
@@ -507,8 +577,9 @@ async def add_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = context.user_data['sub_name']
         cost = context.user_data['sub_cost']
         sub_id = db.add_subscription(user_id, name, cost, date_str)
+        schedule_reminder(context.application, user_id, sub_id, name, date_str)
         await update.message.reply_text(
-            f"✅ **Добавлено!**\n📝 {name}\n💰 {cost:.2f} ₽\n📅 {date_str}\n🆔 ID: {sub_id}",
+            f"✅ **Добавлено!**\n📝 {name}\n💰 {cost:.2f} ₽\n📅 {date_str}\n🆔 ID: {sub_id}\n🔔 Напоминание за 1 день запланировано",
             parse_mode='Markdown',
             reply_markup=get_reply_keyboard()
         )
@@ -528,6 +599,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Восстановить напоминания после перезапуска
+    app.post_init = post_init
 
     # Команды
     app.add_handler(CommandHandler("start", start))
